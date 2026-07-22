@@ -40,13 +40,6 @@ DEFINE_bool(enable_dsa_cp,
             "(DSA). When false, DSA attention runs its original non-CP path "
             "even if cp_size > 1.");
 
-DEFINE_int32(dsa_cp_kv_interleave_size,
-             1,
-             "KV-cache interleave granularity for DSA-CP, aligned with "
-             "vllm-ascend cp_kv_cache_interleave_size. Must divide block_size. "
-             "Default 1 (token interleave). Reserved for M2 decode KV "
-             "sharding; ignored in the M1 prefill-only path.");
-
 DEFINE_int64(tp_size, 1, "Tensor parallelism size, only used for DiT model.");
 
 DEFINE_int64(sp_size, 1, "Sequence parallelism size, only used for DiT model.");
