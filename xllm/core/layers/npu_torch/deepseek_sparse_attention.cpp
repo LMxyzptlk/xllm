@@ -364,6 +364,22 @@ Dsv4PreprocessOutputs run_dsv4_preprocess_fallback(
   const torch::Tensor& q_rope_cos = split_qkv ? q_cos : cos;
   const torch::Tensor& q_rope_sin = split_qkv ? q_sin : sin;
 
+  // DSA-CP empty rank: when this rank has no local query tokens, skip the
+  // quantized q projections (aclnnQuantMatmulV4 does not support 0-row inputs).
+  // The kv path runs normally on the full hidden stream so cache writes still
+  // happen on every rank. M1 only: index-cache write (indexer) is skipped in
+  // forward() when cp_local_empty since all ranks write identical data to their
+  // replicated index-cache copies (kv_split_size=1).
+  if (split_qkv && q_input.size(0) == 0) {
+    auto kv_down = kv_proj->forward(hidden_states);
+    outputs.kv = std::get<0>(kv_layernorm->forward(kv_down));
+    outputs.kv = outputs.kv.view({-1, 1, qk_head_dim});
+    apply_partial_rope(outputs.kv, nope_head_dim, rope_head_dim, cos, sin);
+    outputs.q = torch::zeros({0, n_local_heads, head_dim}, hidden_states.options());
+    outputs.qr = torch::Tensor();  // undefined, unused downstream
+    return outputs;
+  }
+
   auto q_down = q_a_proj->forward(q_input);
   if (q_b_proj->uses_w8a8_dynamic_quant()) {
     xllm::kernel::RmsNormDynamicQuantParams rms_quant_params;
@@ -690,6 +706,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   torch::Tensor q_sin_local;
   int64_t cp_num_full_tokens =
       hidden_states.defined() ? hidden_states.size(0) : 0;
+  bool cp_local_empty = false;
   if (cp_active) {
     cp_meta = DSAMetadataBuilder::build_cp_local_metadata(
         attn_metadata.actual_seq_lengths_query,
@@ -715,7 +732,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
     if (sin.defined() && sin.size(0) >= local_end) {
       q_sin_local = sin.slice(/*dim=*/0, local_start, local_end).contiguous();
     }
-    (void)local_len;
+    cp_local_empty = (local_len == 0);
   }
 
   // Under DSA-CP q_b is full-head, so q must be viewed with all heads; the
@@ -927,7 +944,12 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
   // Same empty/fake-shard guard as the compressor: the indexer selects
   // top-k over compressed positions, so with no compressed positions it
   // has nothing to do and select_qli would launch a 0-block kernel.
-  if (compress_ratio_i == 4 && cmp_kv.defined() && has_compress_positions) {
+  // DSA-CP empty rank: skip indexer when this rank has no local query tokens
+  // (idx_hidden=empty would crash). M1 only (kv_split_size=1): index-cache
+  // writes are identical across ranks since hidden_states is full on every rank,
+  // so skipping rank N's write is safe when rank 0 already wrote the same data.
+  if (compress_ratio_i == 4 && cmp_kv.defined() && has_compress_positions &&
+      !cp_local_empty) {
     auto index_cache = kv_cache.get_index_cache();
     std::optional<torch::Tensor> indexer_cache_scale =
         kv_cache.get_indexer_cache_scale();
@@ -1004,6 +1026,16 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       << "DSAttention requires precomputed sparse metadata for compress_ratio="
       << compress_ratio_i;
 
+  // DSA-CP empty rank: skip sparse attention when this rank has no local query
+  // tokens (q=empty would launch a 0-batch kernel). Produce a zero attention
+  // output to participate in the all_to_all transpose with padding.
+  torch::Tensor attn_output;
+  std::optional<torch::Tensor> output_lse = std::nullopt;
+  if (cp_local_empty) {
+    const int64_t attn_heads = cp_active ? num_heads_ : n_local_heads_;
+    attn_output = torch::zeros({0, attn_heads, head_dim_}, hidden_states.options());
+  } else {
+  // Normal path: run sparse attention
   std::optional<torch::Tensor> cu_seqlens_ori_kv_for_attn = std::nullopt;
   if (use_prefill_attn) {
     // Prefill-style sparse metadata uses query cu-seqlens for ori_kv in the
@@ -1030,7 +1062,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
                                     /*end=*/shard_start + n_local_heads_)
                              .contiguous();
   }
-  auto [attn_output, output_lse] = xllm::kernel::npu::sparse_attn_sharedkv(
+  std::tie(attn_output, output_lse) = xllm::kernel::npu::sparse_attn_sharedkv(
       /*q=*/q,
       /*ori_kv=*/as_optional(ori_kv_for_attn),
       /*cmp_kv=*/compress_ratio_i > 1 ? as_optional(cmp_kv_for_attn)
@@ -1062,6 +1094,7 @@ DSAttentionImpl::forward(const DSAMetadata& attn_metadata,
       /*layout_q=*/"TND",
       /*layout_kv=*/ori_kv_layout,
       /*return_softmax_lse=*/false);
+  }  // end if !cp_local_empty
 
   // 8) Deferred cache write for full prefill.
   if (use_temporary_prefill_kv) {
